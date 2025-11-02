@@ -1,0 +1,11 @@
+
+{% extends "layout.html" %}{% block content %}<div class="card result-card">
+<h2>Results for {{ ticker }}</h2><div class="signal-box">Prediction: <strong>${{ "%.2f"|format(results.last_pred) }}</strong>
+<span class="signal {{ results.signal|lower|replace(' ', '-') }}">{{ results.signal }}</span></div>
+{% if meta.mae_train %}<div class="metrics"><h4>Last Full Training Performance</h4>
+<p><strong>MAE:</strong> {{ "%.4f"|format(meta.mae_train) }}</p><p><strong>R² Score:</strong> {{ "%.4f"|format(meta.r2_train) }}</p>
+<p class="muted">Trained on: {{ meta.training_date.split('T')[0] }}</p></div>{% endif %}
+{% if plot_url and meta.mae_train %}<div class="plot"><h3>Prediction Chart</h3><img src="{{ plot_url }}?t={{ range(1, 100000) | random }}" alt="Prediction plot for {{ ticker }}">
+</div>{% endif %}<div class="summary"><h3>AI-Generated Summary</h3><pre>{{ summary or 'Summary not available for fast predictions.' }}</pre></div>
+<a href="/" class="back-link">← Make another prediction</a></div>{% endblock %}
+        

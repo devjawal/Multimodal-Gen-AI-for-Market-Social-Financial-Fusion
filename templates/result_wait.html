@@ -1,0 +1,37 @@
+{% extends "layout.html" %}
+{% block content %}
+  <h1>Processing {{ ticker }}</h1>
+  <div id="status">
+    <p>Current step: <strong id="step">starting</strong></p>
+    <p id="details" style="white-space:pre-wrap;"></p>
+    <p>Waiting... (this page will update automatically)</p>
+  </div>
+  <div style="margin-top:12px">
+    <a href="/">Cancel and return home</a>
+  </div>
+
+  <script>
+    const ticker = "{{ ticker }}";
+    function fetchStatus() {
+      fetch(`/status?ticker=${ticker}`)
+        .then(r => r.json())
+        .then(d => {
+          document.getElementById("step").innerText = d.step || d.status;
+          document.getElementById("details").innerText = JSON.stringify(d.details || {}, null, 2);
+          if (d.status === "done") {
+            // redirect to results page that uses artifacts (you can change to a dedicated route)
+            window.location.href = `/result?ticker=${ticker}`;
+          } else if (d.status === "error") {
+            document.getElementById("details").innerText = "ERROR: " + (d.details || "");
+          } else {
+            setTimeout(fetchStatus, 3000);
+          }
+        })
+        .catch(e => {
+          console.error(e);
+          setTimeout(fetchStatus, 5000);
+        });
+    }
+    fetchStatus();
+  </script>
+{% endblock %}
