@@ -1,603 +1,642 @@
-# app.py (Final Version with Corrected Advanced Recommendation Logic)
-
+# app2.py — Robust Flask wrapper for final1 pipeline (improved feature alignment + scaler handling)
 import os
-import shutil
+import sys
+import io
+import time
 import joblib
-import re
+import shutil
 import traceback
-import numpy as np
-import pandas as pd
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict
-from threading import Lock
+import importlib.util
+from contextlib import redirect_stdout
+from datetime import datetime
+from flask import Flask, render_template, request, redirect, url_for, flash
 
-# --- All Necessary Imports ---
-from flask import Flask, request, render_template, send_from_directory, redirect, url_for, flash
-from dotenv import load_dotenv
+# Use Agg backend for matplotlib (server-safe)
 import matplotlib
-matplotlib.use("Agg") # Use non-interactive backend for web servers
-import matplotlib.pyplot as plt
-import requests
-import feedparser
-from bs4 import BeautifulSoup
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.metrics import mean_absolute_error, r2_score
-from lightgbm import LGBMRegressor, early_stopping
-import praw
-import yfinance as yf
-from dateutil import parser
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers.legacy import Adam # Use legacy optimizer for M1/M2 Mac compatibility
+matplotlib.use("Agg")
 
-# --- Environment & Setup ---
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "True")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-try:
-    import certifi
-    os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
-    os.environ['SSL_CERT_FILE'] = certifi.where()
-except ImportError:
-    pass
-
+from dotenv import load_dotenv
 load_dotenv()
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
-REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "stock-predictor-v1 by user")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# --------- Paths ----------
+HOME = os.path.expanduser("~")
+CANDIDATE_ARTS = [
+    os.path.join(HOME, "Desktop", "tempMultimodal", "artifacts"),
+    os.path.join(HOME, "Desktop", "TEMPMULTIMODAL", "artifacts"),
+    os.path.join(os.getcwd(), "artifacts"),
+    os.path.join(os.getcwd(), "artifacts_lgbm_advanced"),
+]
+ART_DIR = next((p for p in CANDIDATE_ARTS if os.path.exists(p)), CANDIDATE_ARTS[0])
+os.makedirs(ART_DIR, exist_ok=True)
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+FINAL1_PATH = os.path.join(PROJECT_ROOT, "final1.py")
+
+# --- Import final1 pipeline dynamically (if available) ---
+pipeline = None
+import_error = None
 try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    _YT_TRANSCRIPT_AVAILABLE = True
+    spec = importlib.util.spec_from_file_location("final1", FINAL1_PATH)
+    final1 = importlib.util.module_from_spec(spec)
+    sys.modules["final1"] = final1
+    spec.loader.exec_module(final1)
+    pipeline = final1
 except Exception:
-    _YT_TRANSCRIPT_AVAILABLE = False
+    import_error = traceback.format_exc()
 
-# --- Flask App Initialization ---
+# Flask app
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET", "a-very-secure-secret-key-change-me")
+app.secret_key = os.getenv("FLASK_SECRET", "change-me-please")
 
-# --- Directory & Global Config ---
-RANDOM_SEED = 42
-np.random.seed(RANDOM_SEED)
-BASE_ART_DIR = os.path.join(os.getcwd(), "artifacts_lgbm_advanced")
-STATIC_IMG_DIR = os.path.join(os.getcwd(), "static", "img")
-os.makedirs(BASE_ART_DIR, exist_ok=True)
-os.makedirs(STATIC_IMG_DIR, exist_ok=True)
-_lock = Lock()
+# Create template/static dirs if missing
+TEMPLATES_DIR = os.path.join(PROJECT_ROOT, "templates")
+STATIC_DIR = os.path.join(PROJECT_ROOT, "static")
+IMG_DIR = os.path.join(STATIC_DIR, "img")
+for d in (TEMPLATES_DIR, STATIC_DIR, IMG_DIR):
+    os.makedirs(d, exist_ok=True)
 
-#
-# ==============================================================================
-#  SECTION 1: YOUR COMPLETE after1.py PIPELINE (UNCHANGED)
-# ==============================================================================
-#
-@dataclass
-class Doc:
-    date: pd.Timestamp
-    text: str
-    source: str
+# --- Templates & CSS (kept small & same style as prior) ---
+_layout = """<!doctype html> ... (omitted here for brevity; same as your existing layout) ... """
+# To avoid repeating long template strings in this message, in your copy use the same templates you already have.
+# The rest of the file assumes templates exist at templates/layout.html, templates/index.html, templates/result.html,
+# and style at static/style.css. If not present, previous app2.py wrote them; keep those.
 
-def clean_text(text: str) -> str:
-    if not text: return ""
-    return " ".join(BeautifulSoup(text, "html.parser").get_text(" ").split())
+# ------------------ Utilities & robust model discovery --------------------
 
-_nlp = {"ok": False, "fin_pipe": None, "embedder": None}
-EMB_DIM = 384
-
-def init_nlp():
-    if _nlp["ok"]: return
-    print("Loading NLP models...")
-    try:
-        from transformers import pipeline
-        from sentence_transformers import SentenceTransformer
-        _nlp["fin_pipe"] = pipeline("text-classification", model="ProsusAI/finbert", truncation=True, max_length=512)
-        _nlp["embedder"] = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        _nlp["ok"] = True
-        print("NLP models loaded successfully.")
-    except Exception as e:
-        print(f"WARNING: Failed to load NLP models. Error: {repr(e)}")
-
-def finbert_sentiment_vectors(texts: List[str]) -> np.ndarray:
-    if not texts or not _nlp["ok"]: return np.array([[0.0, 1.0, 0.0]] * len(texts))
-    results = []
-    for text_chunk in [texts[i:i + 16] for i in range(0, len(texts), 16)]:
-        try:
-            preds = _nlp["fin_pipe"](text_chunk)
-            for p in preds:
-                vec = np.zeros(3)
-                label, score = p.get("label", "neutral").lower(), p.get("score", 0.0)
-                if "negative" in label: vec[0] = score
-                elif "positive" in label: vec[2] = score
-                else: vec[1] = score
-                results.append(vec)
-        except Exception: results.extend([np.array([0.0, 1.0, 0.0])] * len(text_chunk))
-    return np.array(results)
-
-def embed_texts(texts: List[str]) -> np.ndarray:
-    if not texts or not _nlp["ok"]: return np.zeros((len(texts), EMB_DIM))
-    return _nlp["embedder"].encode(texts, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True, batch_size=32)
-
-def get_stock_data(ticker: str, days: int) -> pd.DataFrame:
-    end, start = datetime.now(), datetime.now() - timedelta(days=days)
-    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
-    if df.empty: raise RuntimeError(f"No stock data for {ticker}")
-    df = df.reset_index()
-    df.columns = ["_".join(filter(None, col)).lower().replace(" ", "_") if isinstance(col, tuple) else col.lower().replace(" ", "_") for col in df.columns]
-    rename_map = {"adj_close": "close", f"close_{ticker.lower()}": "close", f"open_{ticker.lower()}": "open", f"high_{ticker.lower()}": "high", f"low_{ticker.lower()}": "low", f"volume_{ticker.lower()}": "volume"}
-    df = df.rename(columns=rename_map)
-    date_col = next((c for c in df.columns if 'date' in c.lower()), None)
-    if not date_col: raise RuntimeError(f"'date' column missing! Columns: {df.columns.tolist()}")
-    df.rename(columns={date_col: 'date'}, inplace=True)
-    if "close" not in df.columns: raise RuntimeError(f"'close' column missing! Columns: {df.columns.tolist()}")
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-    return df.sort_values("date").reset_index(drop=True)
-
-def fetch_news_rss(queries: list, days: int) -> List[Doc]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    docs, seen = [], set()
-    for query in queries:
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(f'{query} stock')}&hl=en-US&gl=US&ceid=US:en"
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:200]:
-            published = getattr(entry, "published", getattr(entry, "updated", None))
-            if not published: continue
-            try:
-                dt = parser.parse(published).astimezone(timezone.utc)
-                if dt < cutoff: continue
-                text = clean_text(f"{getattr(entry, 'title', '')}. {getattr(entry, 'summary', '')}")
-                key = (text[:50], dt.date())
-                if text and key not in seen:
-                    docs.append(Doc(date=pd.to_datetime(dt).normalize(), text=text, source="news"))
-                    seen.add(key)
-            except Exception: continue
-    return docs
-
-def fetch_reddit_praw(queries: list, days: int) -> List[Doc]:
-    if not all([REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT]): return []
-    reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, user_agent=REDDIT_USER_AGENT)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    docs, seen = [], set()
-    try:
-        subs = "wallstreetbets+stocks+investing+apple+technology"
-        for query in queries:
-            for submission in reddit.subreddit(subs).search(query, sort="new", limit=300):
-                created = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc)
-                if created < cutoff: continue
-                text = clean_text(f"{submission.title}. {submission.selftext or ''}")
-                key = (submission.id, created.date())
-                if text and key not in seen:
-                    docs.append(Doc(date=pd.to_datetime(created).normalize(), text=text, source="reddit"))
-                    seen.add(key)
-    except Exception as e: print(f"WARNING: Reddit fetch failed: {e}")
-    return docs
-
-def fetch_youtube_docs(queries: list, days: int) -> List[Doc]:
-    if not YOUTUBE_API_KEY: return []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    docs, seen = [], set()
-    for query in queries:
-        params = {"part": "snippet", "q": f'"{query}" stock analysis', "type": "video", "order": "date", "maxResults": 50, "key": YOUTUBE_API_KEY, "publishedAfter": cutoff.isoformat("T").replace("+00:00", "Z")}
-        try:
-            r = requests.get("https://www.googleapis.com/youtube/v3/search", params=params, timeout=20)
-            r.raise_for_status()
-            for item in r.json().get("items", []):
-                video_id = item["id"]["videoId"]
-                if video_id in seen: continue
-                published_at = parser.parse(item["snippet"]["publishedAt"])
-                title = item["snippet"]["title"]
-                transcript = ""
-                if _YT_TRANSCRIPT_AVAILABLE:
-                    try:
-                        transcript = " ".join([t["text"] for t in YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])])
-                    except Exception: pass
-                text = clean_text(f"{title}. {transcript}")
-                if text:
-                    docs.append(Doc(date=pd.to_datetime(published_at).normalize(), text=text, source="youtube"))
-                    seen.add(video_id)
-        except Exception as e: print(f"WARNING: YouTube fetch failed for query '{query}': {e}")
-    return docs
-
-def aggregate_text_features(docs: List[Doc], source: str) -> pd.DataFrame:
-    if not docs: return pd.DataFrame()
-    df = pd.DataFrame([{"date": d.date, "text": d.text} for d in docs])
-    sentiments = finbert_sentiment_vectors(df["text"].tolist())
-    sent_df = pd.DataFrame(sentiments, columns=[f"{source}_sent_neg", f"{source}_sent_neu", f"{source}_sent_pos"])
-    embeddings = embed_texts(df["text"].tolist())
-    emb_df = pd.DataFrame(embeddings, columns=[f"{source}_emb_{i}" for i in range(EMB_DIM)])
-    full_df = pd.concat([df.drop(columns="text"), sent_df, emb_df], axis=1)
-    return full_df.groupby("date").mean().reset_index()
-
-def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
-    out, close = df.copy(), df["close"]
-    out["ret_1"] = close.pct_change(1)
-    out["ret_5"] = close.pct_change(5)
-    for win in [5, 10, 20, 60, 120]:
-        out[f"sma_{win}"] = close.rolling(win).mean()
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0).rolling(win).mean()
-        loss = -delta.where(delta < 0, 0).rolling(win).mean()
-        rs = gain / (loss + 1e-9)
-        out[f"rsi_{win}"] = 100 - (100 / (1 + rs))
-        out[f"vol_{win}"] = out["ret_1"].rolling(win).std()
-    return out
-
-def detect_event_features(all_docs: List[Doc]) -> pd.DataFrame:
-    if not all_docs: return pd.DataFrame()
-    EVENT_KEYWORDS = {"earnings": ["earnings", "quarterly results", "revenue", "profit"], "launch": ["launch", "announcement", "release", "unveiled"], "legal": ["lawsuit", "investigation", "sec", "doj", "settlement"], "partnership": ["partnership", "collaboration", "acquisition", "merger"]}
-    event_data = []
-    for doc in all_docs:
-        if any(re.search(r'\b' + kw + r'\b', doc.text, re.IGNORECASE) for keywords in EVENT_KEYWORDS.values() for kw in keywords):
-            event_data.append({"date": doc.date, "text": doc.text})
-    if not event_data: return pd.DataFrame()
-    df = pd.DataFrame(event_data).drop_duplicates()
-    sentiments = finbert_sentiment_vectors(df["text"].tolist())
-    sent_df = pd.DataFrame(sentiments, columns=["event_sent_neg", "event_sent_neu", "event_sent_pos"])
-    full_df = pd.concat([df.drop(columns="text"), sent_df], axis=1)
-    daily_df = full_df.groupby("date").mean().reset_index()
-    daily_df["is_event_day"] = 1
-    return daily_df
-
-def build_hybrid_featureset(stock_df, news_df, reddit_df, yt_df, event_df) -> pd.DataFrame:
-    features = stock_df.copy()
-    features["date"] = pd.to_datetime(features["date"]).dt.tz_localize(None)
-    for text_df in [news_df, reddit_df, yt_df, event_df]:
-        if not text_df.empty:
-            text_df["date"] = pd.to_datetime(text_df["date"]).dt.tz_localize(None)
-            features = pd.merge(features, text_df, on="date", how="left")
-    features = add_technical_features(features)
-    scaler = MinMaxScaler()
-    features['vol_20_scaled'] = scaler.fit_transform(features[['vol_20']].fillna(0))
-    features['volume_scaled'] = scaler.fit_transform(features[['volume']].fillna(0))
-    news_sentiment_score = features.get('news_sent_pos', 0) - features.get('news_sent_neg', 0)
-    reddit_sentiment_score = features.get('reddit_sent_pos', 0) - features.get('reddit_sent_neg', 0)
-    features['news_attention_score'] = news_sentiment_score * features['vol_20_scaled']
-    features['reddit_attention_score'] = reddit_sentiment_score * features['volume_scaled']
-    lag_periods = [1, 2, 3, 5, 10, 21, 63]
-    lag_cols = [c for c in features.columns if c not in ['date','open','high','low','close'] and '_scaled' not in c]
-    for lag in lag_periods:
-        shifted = features[lag_cols].shift(lag)
-        shifted.columns = [f"{col}_lag_{lag}" for col in shifted.columns]
-        features = pd.concat([features, shifted], axis=1)
-    features['target'] = features['close'].shift(-1)
-    return features.dropna(subset=["target", "close"]).fillna(0).reset_index(drop=True)
-
-def build_residual_sequences(y_true, y_pred, lookback=10):
-    residuals = y_true - y_pred
-    X, y = [], []
-    for i in range(len(residuals) - lookback):
-        X.append(residuals.iloc[i:i+lookback].values)
-        y.append(residuals.iloc[i+lookback])
-    return np.array(X), np.array(y)
-
-def train_residual_lstm(y_true, y_pred, lookback=10):
-    X, y = build_residual_sequences(y_true, y_pred, lookback)
-    if len(X) < 2: return None
-    X = X.reshape((X.shape[0], X.shape[1], 1))
-    model = Sequential([ LSTM(64, activation="tanh", input_shape=(lookback, 1), return_sequences=True), Dropout(0.2), LSTM(32, activation="tanh"), Dense(1) ])
-    model.compile(optimizer=Adam(1e-3), loss="mse")
-    model.fit(X, y, epochs=20, batch_size=16, verbose=0)
-    return model
-
-def generate_gemini_summary(news_docs, reddit_docs, yt_docs, ticker, query, predicted_price=None):
-    if not GEMINI_API_KEY: return "Gemini API key not found."
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
-    texts = [f"[{d.source}] {d.text}" for d in (news_docs + reddit_docs + yt_docs)[:45]]
-    extra = f"\nThe model predicts the next closing price will be around ${predicted_price:.2f}." if predicted_price else ""
-    full_text = " ".join(texts)
-    truncated_text = full_text[:10000] + ('...' if len(full_text) > 10000 else '')
-    prompt = f"Summarize these financial signals for {ticker} ({','.join(query)}), focusing on key events, sentiment, and conflicts.\n\nRecent Texts:\n{truncated_text}\n{extra}"
-    try:
-        return model.generate_content(prompt).text
-    except Exception as e: return f"Summary generation failed: {e}"
-
-# ==============================================================================
-#  SECTION 2: FLASK APPLICATION LOGIC
-# ==============================================================================
-
-def get_ticker_paths(ticker: str):
-    """Generates all file paths for a given ticker."""
-    safe_ticker = ticker.upper().replace("/", "-")
-    art_dir = os.path.join(BASE_ART_DIR, safe_ticker)
-    plot_dir = os.path.join(STATIC_IMG_DIR, safe_ticker)
-    os.makedirs(art_dir, exist_ok=True)
-    os.makedirs(plot_dir, exist_ok=True)
-    return {
-        "lgbm": os.path.join(art_dir, "lgbm_model.pkl"),
-        "scaler": os.path.join(art_dir, "scaler.pkl"),
-        "meta": os.path.join(art_dir, "pipeline_meta.pkl"),
-        "lstm": os.path.join(art_dir, "residual_lstm.keras"),
-        "summary": os.path.join(art_dir, "summary.txt"),
-        "plot": os.path.join(plot_dir, "prediction_comparison.png"),
-        "plot_url": f"/static/img/{safe_ticker}/prediction_comparison.png"
+def find_saved_artifacts():
+    """
+    Return dict with located paths for model/scaler/meta.
+    Tries several common filenames that you mentioned exist in your project.
+    """
+    candidates = {
+        "model": [
+            "lgbm_model.pkl", "lgbm.pkl", "model_lgbm.pkl",
+            "best_stock_model.h5", "best_stock_model.pkl", "best_stock_model.joblib",
+            "best_stock_model_lgbm.pkl"
+        ],
+        "scaler": ["scaler.pkl", "scaler_x.save", "scaler_x.pkl", "scaler_x.joblib"],
+        "meta": ["pipeline_meta.pkl", "pipeline_meta.joblib", "meta.pkl", "meta.joblib"]
     }
+    found = {}
+    for k, names in candidates.items():
+        for n in names:
+            p = os.path.join(ART_DIR, n)
+            if os.path.exists(p):
+                found[k] = p
+                break
+    return found
 
-def compute_advanced_signal(last_feature_row: pd.Series, last_pred: float) -> str:
-    """Computes a sophisticated recommendation based on multiple factors."""
-    # 1. Price Prediction Factor (The most important signal)
-    last_close = last_feature_row.get('close', 0)
-    if last_close == 0: return "HOLD"
-    price_pct_change = (last_pred - last_close) / last_close
+def safe_load_model(path):
+    """
+    Load a model from common formats:
+    - joblib/pickle saved sklearn/LightGBM models
+    - keras .h5 models
+    Returns (model_obj, kind) where kind in {"sklearn", "keras", "unknown"}
+    """
+    if not path:
+        return None, None
+    try:
+        # keras h5
+        if path.endswith(".h5") or path.endswith(".keras"):
+            from tensorflow.keras.models import load_model
+            m = load_model(path)
+            return m, "keras"
+        # try joblib
+        try:
+            m = joblib.load(path)
+            return m, "sklearn"
+        except Exception:
+            # fallback pickle
+            import pickle
+            with open(path, "rb") as f:
+                m = pickle.load(f)
+            return m, "sklearn"
+    except Exception:
+        return None, None
 
-    # 2. Technical Momentum Factor (Is the stock overbought/oversold?)
-    rsi = last_feature_row.get('rsi_20', 50)  # Use 20-day RSI, default to neutral 50
-    
-    # 3. Trend Factor (Is the stock in an uptrend or downtrend?)
-    sma_20 = last_feature_row.get('sma_20', last_close)
-    sma_60 = last_feature_row.get('sma_60', last_close)
-    in_uptrend = sma_20 > sma_60
+def safe_load_scaler(path):
+    if not path:
+        return None
+    try:
+        return joblib.load(path)
+    except Exception:
+        try:
+            import pickle
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
 
-    # 4. Sentiment Factor (What is the news/social media saying?)
-    news_att = last_feature_row.get('news_attention_score', 0)
-    reddit_att = last_feature_row.get('reddit_attention_score', 0)
-    event_sent = last_feature_row.get('event_sent_pos', 0) - last_feature_row.get('event_sent_neg', 0)
-    total_sentiment = news_att + reddit_att + event_sent
+def copy_plot_to_static(plot_basename="final_price_prediction_v15.png"):
+    src = os.path.join(ART_DIR, plot_basename)
+    if not os.path.exists(src):
+        return None
+    dst = os.path.join(IMG_DIR, plot_basename)
+    try:
+        shutil.copyfile(src, dst)
+        return "/static/img/" + plot_basename
+    except Exception:
+        return None
 
-    # --- New Rule-Based Logic ---
-    if price_pct_change > 0.02:
-        return "STRONG BUY"
-    if price_pct_change < -0.02:
-        return "STRONG SELL"
+# robust reindex-in-one-step helper (avoids fragmentation warning)
+def align_features_to_expected(X_df, expected_cols):
+    """
+    Ensure X_df contains all expected_cols (in that order) by adding missing columns in one step.
+    Returns a DataFrame ordered as expected_cols.
+    """
+    import pandas as pd
+    missing = [c for c in expected_cols if c not in X_df.columns]
+    if missing:
+        add = {c: 0.0 for c in missing}
+        # add all at once
+        X_df = pd.concat([X_df, pd.DataFrame({k:[v]*len(X_df) for k,v in add.items()})], axis=1)
+    # Reindex to exact order
+    X_df = X_df.reindex(columns=expected_cols, fill_value=0.0)
+    return X_df
 
-    # For smaller predicted changes, use confirming factors
-    if price_pct_change > 0.005: # Small predicted increase
-        # Confirm with trend and sentiment
-        if in_uptrend and total_sentiment > 0.05:
-            return "BUY"
-        # Contradicted by strong negative sentiment or being overbought
-        if total_sentiment < -0.1 or rsi > 75:
-            return "HOLD"
-        return "BUY" # Default to buy if prediction is positive
+# compute recommendation (unchanged logic; caps are unchanged)
+def compute_recommendation(pred_ret, textual_top10):
+    if pred_ret is None:
+        return "HOLD", "No prediction available", "hold"
+    sent = 0.0
+    for r in textual_top10 or []:
+        try:
+            sent += (float(r.get("pos", 0)) - float(r.get("neg", 0)))
+        except Exception:
+            pass
+    if textual_top10:
+        sent = sent / max(1.0, len(textual_top10))
+    if pred_ret > 0.02:
+        return "STRONG BUY", f"Model +{pred_ret*100:.2f}% | Sent {sent:+.3f}", "buy"
+    if pred_ret > 0.005:
+        if sent > 0.02:
+            return "BUY", f"Slight +{pred_ret*100:.2f}% confirmed by sentiment", "buy"
+        if sent < -0.05:
+            return "HOLD", f"Slightly positive model but negative sentiment ({sent:+.2f})", "hold"
+        return "BUY", f"Model +{pred_ret*100:.2f}%", "buy"
+    if pred_ret < -0.02:
+        return "STRONG SELL", f"Model {pred_ret*100:.2f}% | Sent {sent:+.3f}", "sell"
+    if pred_ret < -0.005:
+        if sent < -0.02:
+            return "SELL", f"Slight negative model (-{abs(pred_ret)*100:.2f}%) with negative sentiment", "sell"
+        if sent > 0.05:
+            return "HOLD", "Slight negative model but positive sentiment", "hold"
+        return "SELL", f"Model -{abs(pred_ret)*100:.2f}%", "sell"
+    return "HOLD", "Model prediction close to neutral", "hold"
 
-    if price_pct_change < -0.005: # Small predicted decrease
-        # Confirm with downtrend and sentiment
-        if not in_uptrend and total_sentiment < -0.05:
-            return "SELL"
-        # Contradicted by strong positive sentiment or being oversold
-        if total_sentiment > 0.1 or rsi < 25:
-            return "HOLD"
-        return "SELL" # Default to sell if prediction is negative
-
-    return "HOLD" # Default case for very small/flat predictions
-
-def run_full_training(ticker: str, queries: list, days: int):
-    """The main, unified training function that runs your entire pipeline."""
-    paths = get_ticker_paths(ticker)
-    
-    init_nlp()
-    stock_df = get_stock_data(ticker, days=days)
-    news_docs = fetch_news_rss(queries, days=days)
-    reddit_docs = fetch_reddit_praw(queries, days=days)
-    yt_docs = fetch_youtube_docs(queries, days=days)
-    all_docs = news_docs + reddit_docs + yt_docs
-
-    news_daily_features = aggregate_text_features(news_docs, "news")
-    reddit_daily_features = aggregate_text_features(reddit_docs, "reddit")
-    yt_daily_features = aggregate_text_features(yt_docs, "yt")
-    event_daily_features = detect_event_features(all_docs)
-
-    final_df = build_hybrid_featureset(
-        stock_df, news_daily_features, reddit_daily_features,
-        yt_daily_features, event_daily_features
-    )
-    if final_df.empty:
-        raise RuntimeError("Dataframe is empty after feature engineering.")
-
-    split_index = int(len(final_df) * 0.8)
-    train_df, test_df = final_df.iloc[:split_index], final_df.iloc[split_index:]
-    
-    X_train = train_df.drop(columns=['date', 'target', 'close'])
-    y_train = train_df['target']
-    X_test = test_df.drop(columns=['date', 'target', 'close'])
-    y_test = test_df['target']
-    X_test = X_test[X_train.columns]
-
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    X_train_scaled_df = pd.DataFrame(X_train_scaled, columns=X_train.columns)
-    X_test_scaled_df = pd.DataFrame(X_test_scaled, columns=X_test.columns)
-
-    model = LGBMRegressor(n_estimators=1000, learning_rate=0.05, num_leaves=31, random_state=RANDOM_SEED)
-    model.fit(X_train_scaled_df, y_train, eval_set=[(X_test_scaled_df, y_test)], eval_metric='l1', callbacks=[early_stopping(100, verbose=False)])
-
-    predictions = model.predict(X_test_scaled_df)
-    
-    corrected_preds = predictions.copy()
-    residual_lstm = train_residual_lstm(y_test.reset_index(drop=True), pd.Series(predictions))
-    if residual_lstm:
-        lookback=10
-        X_resid, _ = build_residual_sequences(y_test.reset_index(drop=True), pd.Series(predictions), lookback=lookback)
-        if len(X_resid) > 0:
-            X_resid_reshaped = X_resid.reshape((X_resid.shape[0], X_resid.shape[1], 1))
-            resid_preds = residual_lstm.predict(X_resid_reshaped, verbose=0).flatten()
-            padded = np.zeros_like(predictions)
-            pad_len = min(len(padded) - lookback, len(resid_preds))
-            padded[lookback : lookback + pad_len] = resid_preds[:pad_len]
-            corrected_preds += padded
-            residual_lstm.save(paths["lstm"])
-    
-    final_mae = mean_absolute_error(y_test, corrected_preds)
-    final_r2 = r2_score(y_test, corrected_preds)
-
-    joblib.dump(model, paths["lgbm"])
-    joblib.dump(scaler, paths["scaler"])
-    meta = {"feature_names": list(X_train.columns), "lookback": 10, "mae_train": final_mae, "r2_train": final_r2, "training_date": datetime.utcnow().isoformat()}
-    joblib.dump(meta, paths["meta"])
-
-    last_pred = float(corrected_preds[-1])
-    summary = generate_gemini_summary(news_docs, reddit_docs, yt_docs, ticker, queries, last_pred)
-    with open(paths["summary"], "w", encoding='utf-8') as f: f.write(summary)
-    
-    plt.style.use("seaborn-v0_8-whitegrid")
-    fig, ax = plt.subplots(figsize=(15, 7))
-    ax.plot(test_df['date'], y_test, label="Actual Price", color="royalblue")
-    ax.plot(test_df['date'], predictions, label="LGBM Prediction", color="darkorange", ls="--")
-    if residual_lstm:
-        ax.plot(test_df['date'], corrected_preds, label="Hybrid (LGBM + LSTM)", color="green", ls="-.")
-    ax.set_title(f"{ticker} Price Prediction", fontsize=16); ax.legend(); fig.tight_layout()
-    plt.savefig(paths["plot"]); plt.close(fig)
-
-    signal = compute_advanced_signal(test_df.iloc[-1], last_pred)
-    return {"last_pred": last_pred, "signal": signal}
-
-def predict_fast(ticker: str):
-    """Loads artifacts and predicts using only the latest stock data."""
-    paths = get_ticker_paths(ticker)
-    
-    model = joblib.load(paths["lgbm"])
-    scaler = joblib.load(paths["scaler"])
-    meta = joblib.load(paths["meta"])
-    feature_names = meta["feature_names"]
-    
-    days_to_fetch = 120 + 63 + 10 
-    stock_df = get_stock_data(ticker, days_to_fetch)
-    
-    features_df = build_hybrid_featureset(stock_df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
-    
-    last_row = features_df.tail(1)
-    
-    X_predict = pd.DataFrame(columns=feature_names)
-    X_predict_data = last_row.drop(columns=['date', 'target', 'close'], errors='ignore')
-    X_predict = pd.concat([X_predict, X_predict_data], ignore_index=True).fillna(0)
-    X_predict = X_predict[feature_names]
-
-    X_scaled = scaler.transform(X_predict)
-    X_scaled_df = pd.DataFrame(X_scaled, columns=feature_names)
-    prediction = model.predict(X_scaled_df)[0]
-    
-    signal = compute_advanced_signal(last_row.iloc[0], prediction)
-    return {"last_pred": prediction, "signal": signal}
+# ------------------ Routes ---------------------
 
 @app.route("/", methods=["GET"])
 def index():
+    if import_error:
+        flash("Warning: failed to import final1 module; reuse helpers may be limited.", "error")
     return render_template("index.html")
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    if not _lock.acquire(blocking=False):
-        flash("Another process is already running. Please wait.", "error")
-        return redirect(url_for("index"))
-    
-    try:
-        ticker = request.form.get("ticker", "").strip().upper()
-        queries = [q.strip() for q in request.form.get("queries", "").split(",")] if request.form.get("queries") else [ticker]
-        days = int(request.form.get("days", 1200))
-        retrain = "retrain" in request.form
+    ticker = request.form.get("ticker", "AAPL").strip().upper()
+    days = int(request.form.get("days", 1200))
+    predict_date = request.form.get("predict_date") or None
+    queries_raw = request.form.get("queries", "")
+    queries = [q.strip() for q in queries_raw.split(",") if q.strip()] or [ticker]
+    mode = request.form.get("mode", "reuse")
 
-        if not ticker:
-            flash("Ticker symbol is required.", "error")
+    prev_close = None
+    pred_price = None
+    pred_ret = None
+    metrics = {"lgbm_mae": None, "lgbm_r2": None, "hybrid_mae": None, "hybrid_r2": None}
+    top10_rows = []
+    
+
+
+    plot_url = None
+
+    try:
+        # find artifacts
+        arts = find_saved_artifacts()
+        model_path = arts.get("model")
+        scaler_path = arts.get("scaler")
+        meta_path = arts.get("meta")
+
+        # If user chose full training, run final1.main() (it will write artifacts)
+        if mode == "train":
+            if not os.path.exists(FINAL1_PATH):
+                flash("final1.py not found for full retrain.", "error")
+                return redirect(url_for("index"))
+            # call final1.main() capturing stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                try:
+                    # set args in module if available
+                    if pipeline:
+                        if hasattr(pipeline, "TICKER"):
+                            pipeline.TICKER = ticker
+                        if hasattr(pipeline, "QUERY"):
+                            pipeline.QUERY = queries
+                        if hasattr(pipeline, "DAYS"):
+                            pipeline.DAYS = int(days)
+                        pipeline.main()
+                    else:
+                        # dynamic import fallback
+                        spec2 = importlib.util.spec_from_file_location("final1", FINAL1_PATH)
+                        mod = importlib.util.module_from_spec(spec2)
+                        sys.modules["final1"] = mod
+                        spec2.loader.exec_module(mod)
+                        if hasattr(mod, "TICKER"):
+                            mod.TICKER = ticker
+                        if hasattr(mod, "QUERY"):
+                            mod.QUERY = queries
+                        if hasattr(mod, "DAYS"):
+                            mod.DAYS = int(days)
+                        mod.main()
+                except Exception:
+                    traceback.print_exc(file=buf)
+            # after training, refresh artifact paths
+            arts = find_saved_artifacts()
+            model_path = arts.get("model")
+            scaler_path = arts.get("scaler")
+            meta_path = arts.get("meta")
+
+        # --- Build features using pipeline helpers (required) ---
+        if pipeline is None:
+            flash("Pipeline helpers (final1) not importable — cannot build features.", "error")
             return redirect(url_for("index"))
 
-        paths = get_ticker_paths(ticker)
-        artifacts_exist = os.path.exists(paths["lgbm"])
+        stock_df = pipeline.get_stock_data(ticker, days=days)
+        news_docs = pipeline.fetch_news_rss(queries, days=days)
+        reddit_docs = pipeline.fetch_reddit_praw(queries, days=days)
+        yt_docs = pipeline.fetch_youtube_docs(queries, days=days)
+        event_df = pipeline.detect_event_features(news_docs + reddit_docs + yt_docs)
+        news_feats = pipeline.process_text_source(news_docs, "news")
+        reddit_feats = pipeline.process_text_source(reddit_docs, "reddit")
+        yt_feats = pipeline.process_text_source(yt_docs, "youtube")
+        final_df = pipeline.build_hybrid_featureset(stock_df, news_feats, reddit_feats, yt_feats, event_df)
 
-        if retrain or not artifacts_exist:
-            flash(f"Training new model for {ticker}. This will take several minutes...", "info")
-            results = run_full_training(ticker, queries, days)
-        else:
-            flash(f"Using existing model for a fast prediction for {ticker}.", "info")
-            results = predict_fast(ticker)
+        if final_df.empty:
+            flash("Feature engineering returned empty DataFrame — aborting.", "error")
+            return redirect(url_for("index"))
+
         
-        meta = joblib.load(paths["meta"]) if os.path.exists(paths["meta"]) else {}
-        summary = ""
-        if os.path.exists(paths["summary"]):
-            with open(paths["summary"], 'r', encoding='utf-8') as f:
-                summary = f.read()
 
-        return render_template("result.html",
-                               ticker=ticker,
-                               results=results,
-                               meta=meta,
-                               summary=summary,
-                               plot_url=paths["plot_url"])
+        # --- Choose the row (date) for prediction ---
+        import pandas as pd
+
+        if predict_date:
+            try:
+                # Convert string to datetime for exact/nearest matching
+                predict_date = pd.to_datetime(predict_date)
+
+                # If exact date available
+                row = final_df[final_df["date"] == predict_date]
+
+                # If no exact match, use the closest available date
+                if row.empty:
+                    closest_idx = (final_df["date"] - predict_date).abs().argsort()[:1]
+                    row = final_df.iloc[closest_idx]
+                    print(f"[INFO] No exact match for {predict_date.date()}, using closest date: {row['date'].iloc[0].date()}")
+            except Exception as e:
+                print(f"[WARN] Could not match date properly: {e}. Using latest row instead.")
+                row = final_df.tail(1)
+        else:
+            # Default: predict for the latest available data
+            row = final_df.tail(1)
+
+        row = row.reset_index(drop=True)
+        prev_close = float(row["close"].iloc[0])
+
+
+        # Drop non-feature cols
+        X = row.drop(columns=["date", "target_ret", "target"], errors="ignore")
+
+        # --- Load model, scaler, and meta ---
+        if not model_path:
+            flash("No trained model found. Run full retrain first.", "error")
+            return redirect(url_for("index"))
+
+        model = joblib.load(model_path)
+        scaler = joblib.load(scaler_path) if scaler_path and os.path.exists(scaler_path) else None
+        meta = joblib.load(meta_path) if meta_path and os.path.exists(meta_path) else {}
+
+# --- Align columns strictly to training set structure ---
+        expected_cols = None
+        if meta and isinstance(meta, dict):
+            expected_cols = meta.get("feature_columns")
+        
+        if expected_cols is None and hasattr(model, "feature_name_"):
+            # Fallback if meta.pkl is missing feature_columns
+            expected_cols = list(model.feature_name_)
+
+        import pandas as pd
+        if expected_cols:
+            print(f"[INFO] Aligning {len(X.columns)} current features to {len(expected_cols)} expected training features.")
+            
+            # This single reindex step handles all cases:
+            # 1. Drops columns in X that are not in expected_cols.
+            # 2. Adds columns from expected_cols that are not in X (fills with 0.0).
+            # 3. Sorts all columns to match the exact order of expected_cols.
+            X = X.reindex(columns=expected_cols, fill_value=0.0)
+            
+            print(f"[INFO] DataFrame aligned. Final shape for scaling: {X.shape}")
+
+        elif scaler is not None and hasattr(scaler, "n_features_in_"):
+            # Secondary fallback if we have scaler but no meta
+            expected_num_features = scaler.n_features_in_
+            if X.shape[1] != expected_num_features:
+                flash(f"Feature mismatch: Model expects {expected_num_features} features, but pipeline generated {X.shape[1]}.", "error")
+                return redirect(url_for("index"))
+            print("[WARN] No 'feature_columns' list found. Proceeding with raw values; trusting column order.")
+        
+        elif not expected_cols:
+             print("[WARN] No 'feature_columns' metadata found. Prediction may be unreliable.")
+
+
+        # Ensure numeric dtype
+        X = X.astype(float).fillna(0.0)
+
+
+        # --- Scale input (robust to feature-name mismatches) ---
+        if scaler is not None:
+            try:
+                # The .reindex() above ensures feature names and order match.
+                # This should now work without the fallback.
+                X_scaled = scaler.transform(X)
+                
+            except Exception as e:
+                # This fallback should no longer be needed, but kept as a safety net
+                import numpy as np
+                print(f"[WARN] Scaler transform failed despite alignment. Using raw numpy transform. Details: {e}")
+                
+                # Check if the error is about number of features
+                if "features" in str(e) and hasattr(scaler, "n_features_in_"):
+                    n_expected = scaler.n_features_in_
+                    if X.shape[1] != n_expected:
+                        flash(f"CRITICAL: Scaler expects {n_expected} features, but got {X.shape[1]}. Retrain model.", "error")
+                        return redirect(url_for("index"))
+                
+                X_scaled = scaler.transform(np.asarray(X))
+        else:
+            X_scaled = X.values # Use .values if no scaler
+
+        # --- Predict next-day return ---
+        try:
+            pred_ret = float(model.predict(X_scaled)[0])
+        except Exception as e:
+            flash(f"Prediction failed: {e}", "error")
+            pred_ret = None
+
+        # --- Compute next-day predicted price (raw) ---
+        pred_price_raw = prev_close * (1.0 + pred_ret) if pred_ret is not None else None
+
+        # --- SHORT-TERM SENTIMENT ADJUSTMENT (past 7 days) ---
+        # Heuristic: aggregate past week textual sentiment (news/reddit/yt),
+        # then nudge pred_price by a fraction of prior day's (high-low) depending on sentiment sign.
+        try:
+            import pandas as pd
+            lookback_days = 7
+            # date of the chosen row
+            chosen_date = pd.to_datetime(row["date"].iloc[0])
+
+            # select past week (strictly before or up to chosen_date)
+            mask = (final_df["date"] <= chosen_date) & (final_df["date"] > (chosen_date - pd.Timedelta(days=lookback_days)))
+            past_week = final_df.loc[mask]
+
+            # Find per-source aggregated sentiment columns if present (created in build_hybrid_featureset)
+            sent_cols = [c for c in final_df.columns if c.endswith("_agg_sent")]
+            # If att-style or pca-only present, fallback to pos-neg difference:
+            if not sent_cols:
+                pos_cols = [c for c in final_df.columns if "_sent_pos" in c]
+                neg_cols = [c for c in final_df.columns if "_sent_neg" in c]
+                # build synthetic agg_sent columns in-memory
+                for p, n in zip(pos_cols, neg_cols):
+                    # create a name that won't be stored back to final_df
+                    final_df[f"_tmp_{p}_agg"] = final_df[p] - final_df[n]
+                sent_cols = [c for c in final_df.columns if c.startswith("_tmp_") and c.endswith("_agg")]
+
+            if len(past_week) == 0 or len(sent_cols) == 0:
+                mean_sent = 0.0
+            else:
+                # mean across days then mean across sources (gives one scalar)
+                mean_sent = past_week[sent_cols].mean().mean()
+
+            # Compute prior-day high-low (use the row chosen)
+            try:
+                prev_hl = float(row["high"].iloc[0]) - float(row["low"].iloc[0])
+                if prev_hl < 0: prev_hl = abs(prev_hl)
+            except Exception:
+                prev_hl = 0.0
+
+            # Tuning knobs (change these as you experiment)
+            POS_THRESH = 0.02    # above this -> positive
+            NEG_THRESH = -0.02   # below this -> negative
+            SCALE = 2.0          # scales how much sentiment magnitude maps to fraction of high-low
+            MAX_FRACTION = 0.8   # don't allow adjustment larger than 80% of prev_hl
+
+            # Determine adjustment fraction from mean_sent (clamped)
+            adj_fraction = min(MAX_FRACTION, abs(mean_sent) * SCALE)
+            # If sentiment is tiny (near neutral), shrink fraction further
+            if abs(mean_sent) < 0.005:
+                adj_fraction *= 0.25
+
+            pred_price = pred_price_raw
+            # Apply rule: positive -> add prev_hl*adj_fraction; negative -> subtract
+            if pred_price is not None and prev_hl > 0:
+                if mean_sent >= POS_THRESH:
+                    pred_price = pred_price_raw + (prev_hl * adj_fraction)
+                    adj_reason = f"positive_sentiment (mean={mean_sent:.3f}) -> +{prev_hl*adj_fraction:.4f}"
+                elif mean_sent <= NEG_THRESH:
+                    pred_price = pred_price_raw - (prev_hl * adj_fraction)
+                    adj_reason = f"negative_sentiment (mean={mean_sent:.3f}) -> -{prev_hl*adj_fraction:.4f}"
+                else:
+                    adj_reason = f"neutral_sentiment (mean={mean_sent:.3f}) -> no adj"
+            else:
+                adj_reason = "no prev_hl or no prediction"
+
+            # Clean up temporary columns if created
+            tmp_cols = [c for c in final_df.columns if c.startswith("_tmp_") and c.endswith("_agg")]
+            if tmp_cols:
+                final_df.drop(columns=tmp_cols, inplace=True, errors="ignore")
+
+        except Exception as e:
+            # If anything fails, keep raw prediction
+            pred_price = pred_price_raw
+            adj_reason = f"sentiment_adj_error: {e}"
+
+        # Now pred_price is adjusted (and pred_price_raw preserved for comparison)
+
+        # --- Load metrics for table ---
+        metrics = {
+            "lgbm_mae": meta.get("mae_lgbm"),
+            "lgbm_r2": meta.get("r2_lgbm"),
+            "hybrid_mae": meta.get("mae_hybrid"),
+            "hybrid_r2": meta.get("r2_hybrid"),
+        }
+
+
+        # Load top10 textual CSV if present
+        csv_path = os.path.join(ART_DIR, f"{ticker}_top10_textual_insights.csv")
+        if os.path.exists(csv_path):
+            try:
+                import pandas as pd
+                df_top10 = pd.read_csv(csv_path).head(10)
+                for _, r in df_top10.iterrows():
+                    top10_rows.append({
+                        "source": r.get("source", ""),
+                        "date": str(r.get("date", "")).split(" ")[0],
+                        "pos": f"{float(r.get('pos',0)):.2f}",
+                        "neu": f"{float(r.get('neu',0)):.2f}",
+                        "neg": f"{float(r.get('neg',0)):.2f}",
+                        "text": (r.get("text","")[:140] + "...") if len(str(r.get("text",""))) > 140 else r.get("text","")
+                    })
+            except Exception:
+                pass
+
+        # copy plot if exists
+        plot_url = copy_plot_to_static("final_price_prediction_v15.png")
+
+        # --- Generate Gemini summary dynamically for each prediction ---
+        gemini_text = None
+        try:
+            if pipeline and hasattr(pipeline, "generate_gemini_summary"):
+                gemini_text = pipeline.generate_gemini_summary(
+                    news_docs,
+                    reddit_docs,
+                    yt_docs,
+                    ticker,
+                    queries,
+                    predicted_price=pred_price,
+                    stock_df=stock_df
+                )
+                # also store it temporarily if you wish
+                with open(os.path.join(ART_DIR, f"summary_{ticker}.txt"), "w") as f:
+                    f.write(gemini_text or "")
+            else:
+                gemini_text = "Gemini module not found in pipeline."
+        except Exception as e:
+            gemini_text = f"Gemini summary failed to generate: {e}"
+
+        # --- Build Event Day → Textual Docs Table (with event type) ---
+        event_table = []
+        try:
+            if "is_event_day" in final_df.columns:
+                # Filter only event days (where event flag = 1)
+                event_days_df = final_df[final_df["is_event_day"] == 1].copy()
+
+                # Try to get event type column if available, else label as "General Event"
+                event_type_col = None
+                for c in final_df.columns:
+                    if "event_type" in c.lower() or "event_label" in c.lower():
+                        event_type_col = c
+                        break
+
+                for _, ev_row in event_days_df.iterrows():
+                    ev_date = str(ev_row["date"])[:10]
+                    ev_type = str(ev_row[event_type_col]) if event_type_col and ev_row[event_type_col] else "General Event"
+
+                    docs_for_day = []
+                    for source_name, doc_list in [("News", news_docs), ("Reddit", reddit_docs), ("YouTube", yt_docs)]:
+                        for doc in doc_list:
+                            # handle Doc class or dict robustly (avoid evaluating doc.get if doc is a Doc)
+                            if hasattr(doc, "date"):
+                                pub_date = str(doc.date)[:10]
+                                title = getattr(doc, "text", "")
+                                sentiment_val = getattr(doc, "sentiment", "")
+                            elif isinstance(doc, dict):
+                                pub_date = str(doc.get("publishedAt", doc.get("date", "")))[:10]
+                                title = doc.get("title", "") or doc.get("text", "")
+                                sentiment_val = doc.get("sentiment", "")
+                            else:
+                                pub_date = ""
+                                title = ""
+                                sentiment_val = ""
+
+                            if ev_date in pub_date:
+                                docs_for_day.append({
+                                    "date": ev_date,
+                                    "event_type": ev_type,
+                                    "source": source_name,
+                                    "title": (title or "")[:100],
+                                    "sentiment": sentiment_val
+                                })
+                            if len(docs_for_day) >= 3:
+                                break
+
+
+                    if docs_for_day:
+                        event_table.extend(docs_for_day)
+        except Exception as e:
+            print(f"[WARN] Could not create event_table: {e}")
+            event_table = []
+
+
+        # --- Recommendation based on sentiment-adjusted prediction and aggregated sentiment ---
+        # Note: this overrides compute_recommendation() result based on adjusted sentiment.
+        try:
+            # ensure mean_sent, pred_price, pred_price_raw are defined
+            if "mean_sent" not in locals():
+                mean_sent = 0.0
+            # thresholds used earlier for adjustment (keep consistent)
+            POS_THRESH = locals().get("POS_THRESH", 0.02)
+            NEG_THRESH = locals().get("NEG_THRESH", -0.02)
+
+            # If sentiment is neutral -> HOLD
+            if mean_sent is None:
+                mean_sent = 0.0
+
+            if NEG_THRESH < mean_sent < POS_THRESH:
+                recommendation = "HOLD"
+                rec_class = "hold"
+                rec_reason = f"Neutral sentiment (mean={mean_sent:.3f})"
+            else:
+                # If adjusted and raw predictions exist, compare them
+                if (pred_price is None) or ('pred_price_raw' not in locals() or pred_price_raw is None):
+                    # fallback to original logic if any value missing
+                    recommendation, rec_reason, rec_class = compute_recommendation(pred_ret, top10_rows)
+                else:
+                    if pred_price > pred_price_raw:
+                        recommendation = "BUY"
+                        rec_class = "buy"
+                        rec_reason = f"Adjusted > model: {pred_price_raw:.2f} → {pred_price:.2f} | mean_sent={mean_sent:.3f}"
+                    elif pred_price < pred_price_raw:
+                        recommendation = "SELL"
+                        rec_class = "sell"
+                        rec_reason = f"Adjusted < model: {pred_price_raw:.2f} → {pred_price:.2f} | mean_sent={mean_sent:.3f}"
+                    else:
+                        recommendation = "HOLD"
+                        rec_class = "hold"
+                        rec_reason = f"No change after sentiment adjustment (mean={mean_sent:.3f})"
+
+        except Exception as e:
+            # safe fallback to existing recommendation logic
+            recommendation, rec_reason, rec_class = compute_recommendation(pred_ret, top10_rows)
+
+        ts = int(time.time())
+
+        return render_template(
+            "result.html",
+            ticker=ticker,
+            # prev_close=f"{prev_close:.2f}",
+            # pred_price=f"{pred_price:.2f}" if pred_price else None,
+            prev_close=prev_close,
+            pred_price=pred_price, 
+            recommendation=recommendation,
+            rec_reason=rec_reason,
+            rec_class=rec_class,
+            metrics=metrics,
+            plot_url=plot_url,
+            ts=ts,
+            top10=top10_rows,
+            gemini=gemini_text,
+            adj_reason=adj_reason,
+            event_table=event_table
+
+        )
 
     except Exception as e:
         traceback.print_exc()
-        flash(f"An error occurred: {str(e)}", "error")
+        flash(f"Unexpected error: {e}", "error")
         return redirect(url_for("index"))
-    finally:
-        _lock.release()
 
 if __name__ == "__main__":
-    os.makedirs("templates", exist_ok=True)
-    os.makedirs("static", exist_ok=True)
-
-    with open("templates/layout.html", "w") as f:
-        f.write("""
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Multimodal Stock Predictor</title><link rel="stylesheet" href="/static/style.css"></head><body><div class="container">
-<header><h1>📈 Multimodal Stock Predictor</h1></header><main>
-{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}{% for category, message in messages %}
-<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}
-{% block content %}{% endblock %}</main><footer>
-<p>Powered by LightGBM, LSTM, and Multimodal Data Fusion</p></footer></div></body></html>
-        """)
-
-    with open("templates/index.html", "w") as f:
-        f.write("""
-{% extends "layout.html" %}{% block content %}<div class="card">
-<form method="post" action="/predict"><div class="form-group"><label for="ticker">Ticker Symbol</label>
-<input id="ticker" name="ticker" value="AAPL" required placeholder="e.g., AAPL, GOOG, NAZARA.NS"></div>
-<div class="form-group"><label for="queries">Search Queries (comma-separated)</label>
-<input id="queries" name="queries" value="Apple, Iphone, Tim cook" placeholder="Used for News, Reddit, YouTube"></div>
-<div class="form-group"><label for="days">Training History (Days)</label><input id="days" name="days" type="number" value="1200"></div>
-<div class="form-group checkbox-group"><input type="checkbox" id="retrain" name="retrain">
-<label for="retrain">Force Full Retraining (slower, full analysis)</label></div>
-<button type="submit">Analyze & Predict</button></form></div>{% endblock %}
-        """)
-
-    with open("templates/result.html", "w") as f:
-        f.write("""
-{% extends "layout.html" %}{% block content %}<div class="card result-card">
-<h2>Results for {{ ticker }}</h2><div class="signal-box">Prediction: <strong>${{ "%.2f"|format(results.last_pred) }}</strong>
-<span class="signal {{ results.signal|lower|replace(' ', '-') }}">{{ results.signal }}</span></div>
-{% if meta.mae_train %}<div class="metrics"><h4>Last Full Training Performance</h4>
-<p><strong>MAE:</strong> {{ "%.4f"|format(meta.mae_train) }}</p><p><strong>R² Score:</strong> {{ "%.4f"|format(meta.r2_train) }}</p>
-<p class="muted">Trained on: {{ meta.training_date.split('T')[0] }}</p></div>{% endif %}
-{% if plot_url and meta.mae_train %}<div class="plot"><h3>Prediction Chart</h3><img src="{{ plot_url }}?t={{ range(1, 100000) | random }}" alt="Prediction plot for {{ ticker }}">
-</div>{% endif %}<div class="summary"><h3>AI-Generated Summary</h3><pre>{{ summary or 'Summary not available for fast predictions.' }}</pre></div>
-<a href="/" class="back-link">← Make another prediction</a></div>{% endblock %}
-        """)
-
-    with open("static/style.css", "w") as f:
-        f.write("""
-:root { --bg: #EDEDED; --card-bg: #fff; --text: #334155; --heading: #1e293b; --border: #e2e8f0; --shadow: 0 10px 25px -5px rgba(0,0,0,0.07); --primary: #4f46e5; --primary-light: #e0e7ff; --buy: #16a34a; --sell: #dc2626; --hold: #64748b; --info-bg: #eff6ff; --info-text: #1d4ed8; --error-bg: #fef2f2; --error-text: #991b1b; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 2rem; }
-.container { max-width: 900px; margin: 0 auto; }
-header h1 { color: var(--heading); text-align: center; font-size: 2rem; margin-bottom: 2rem; }
-.card { background: var(--card-bg); border-radius: 12px; padding: 2rem; box-shadow: var(--shadow); }
-.form-group { margin-bottom: 1.5rem; }
-label { font-weight: 600; display: block; margin-bottom: 0.5rem; }
-input[type="text"], input[type="number"] { width: 100%; padding: 0.75rem; border: 1px solid var(--border); border-radius: 8px; font-size: 1rem; box-sizing: border-box; transition: all 0.2s ease; }
-input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-light); }
-.checkbox-group { display: flex; align-items: center; }
-.checkbox-group input { margin-right: 0.5rem; width: auto; height: 1em; width: 1em; }
-button { width: 100%; padding: 1rem; background: var(--primary); color: #fff; border: none; border-radius: 8px; font-size: 1.1rem; font-weight: 600; cursor: pointer; transition: background 0.2s ease; }
-button:hover { background: #4338ca; }
-.flash { padding: 1rem; margin-bottom: 1rem; border-radius: 8px; border: 1px solid transparent; }
-.flash.info { background: var(--info-bg); color: var(--info-text); border-color: #bfdbfe; }
-.flash.error { background: var(--error-bg); color: var(--error-text); border-color: #fecaca; }
-.result-card h2 { text-align: center; color: var(--heading); }
-.signal-box { text-align: center; font-size: 1.5rem; margin-bottom: 2rem; background: var(--bg); padding: 1rem; border-radius: 8px; }
-.signal { font-weight: bold; color: #fff; padding: 0.5rem 1.5rem; border-radius: 50px; margin-left: 1rem; text-transform: uppercase; font-size: 1.2rem;}
-.signal.buy { background: var(--buy); }
-.signal.strong-buy { background: #14532d; }
-.signal.sell { background: var(--sell); }
-.signal.strong-sell { background: #7f1d1d; }
-.signal.hold { background: var(--hold); }
-.metrics { background: var(--bg); padding: 1rem; border-radius: 8px; text-align: center; margin: 2rem 0; }
-.metrics p { margin: 0.5rem 0; }
-.muted { color: #64748b; font-size: 0.9rem; }
-.plot img { max-width: 100%; border-radius: 8px; margin-top: 1.5rem; border: 1px solid var(--border); }
-.summary { margin-top: 2rem; }
-.summary h3, .plot h3 { color: var(--heading); }
-.summary pre { background: #1e293b; color: #e2e8f0; padding: 1.5rem; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; font-size: 0.9rem; line-height: 1.6; }
-.back-link { display: inline-block; margin-top: 2rem; font-weight: 600; color: var(--primary); }
-footer { text-align: center; margin-top: 2rem; color: #94a3b8; }
-        """)
-
-    app.run(host="0.0.0.0", port=5691, debug=True)
+    port = int(os.getenv("FLASK_PORT", "5691"))
+    print(f"Starting Flask (artifacts dir = {ART_DIR}) on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=True)

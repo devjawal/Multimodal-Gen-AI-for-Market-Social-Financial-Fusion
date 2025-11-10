@@ -1,9 +1,26 @@
-
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Multimodal Stock Predictor</title><link rel="stylesheet" href="/static/style.css"></head><body><div class="container">
-<header><h1>📈 Multimodal Stock Predictor</h1></header><main>
-{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}{% for category, message in messages %}
-<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}
-{% block content %}{% endblock %}</main><footer>
-<p>Powered by LightGBM, LSTM, and Multimodal Data Fusion</p></footer></div></body></html>
-        
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>📈 MULTIMODAL GENERATIVE AI FOR
+MARKET, SOCIAL & FINANCIAL FUSION</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="container">
+<header><h1>📊 MULTIMODAL GENERATIVE AI FOR
+MARKET, SOCIAL & FINANCIAL FUSION</h1></header>
+<main>
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    {% for category, msg in messages %}
+      <div class="flash {{ category }}">{{ msg }}</div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
+{% block content %}{% endblock %}
+</main>
+</div>
+</body>
+</html>

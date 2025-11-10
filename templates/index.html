@@ -1,11 +1,25 @@
+{% extends "layout.html" %}{% block content %}
+<div class="card">
+  <form method="post" action="/predict">
+    <div class="form-grid">
+      <div><label>Ticker</label><input name="ticker" value="AAPL" required/></div>
+      <div><label>History days</label><input name="days" type="number" value="1200"/></div>
 
-{% extends "layout.html" %}{% block content %}<div class="card">
-<form method="post" action="/predict"><div class="form-group"><label for="ticker">Ticker Symbol</label>
-<input id="ticker" name="ticker" value="AAPL" required placeholder="e.g., AAPL, GOOG, NAZARA.NS"></div>
-<div class="form-group"><label for="queries">Search Queries (comma-separated)</label>
-<input id="queries" name="queries" value="Apple, Iphone, Tim cook" placeholder="Used for News, Reddit, YouTube"></div>
-<div class="form-group"><label for="days">Training History (Days)</label><input id="days" name="days" type="number" value="1200"></div>
-<div class="form-group checkbox-group"><input type="checkbox" id="retrain" name="retrain">
-<label for="retrain">Force Full Retraining (slower, full analysis)</label></div>
-<button type="submit">Analyze & Predict</button></form></div>{% endblock %}
-        
+      <!-- Removed Predict Date input -->
+
+      <div style="grid-column:1 / -1;">
+        <label>Queries (comma separated)</label>
+        <input name="queries" value="Apple Inc, iPhone, Tim Cook"/>
+      </div>
+
+      <div style="grid-column:1 / -1;">
+        <label>Mode</label>
+        <label><input type="radio" name="mode" value="reuse" checked/> Reuse Saved Model (fast)</label>
+        <label><input type="radio" name="mode" value="train"/> Full Retrain </label>
+      </div>
+
+      <div style="grid-column:1 / -1;"><button type="submit">Run Prediction</button></div>
+    </div>
+  </form>
+</div>
+{% endblock %}
