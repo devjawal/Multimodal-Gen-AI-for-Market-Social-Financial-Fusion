@@ -19,7 +19,7 @@
           document.getElementById("step").innerText = d.step || d.status;
           document.getElementById("details").innerText = JSON.stringify(d.details || {}, null, 2);
           if (d.status === "done") {
-            // redirect to results page that uses artifacts (you can change to a dedicated route)
+            
             window.location.href = `/result?ticker=${ticker}`;
           } else if (d.status === "error") {
             document.getElementById("details").innerText = "ERROR: " + (d.details || "");

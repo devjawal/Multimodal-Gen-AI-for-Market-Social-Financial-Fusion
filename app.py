@@ -1,4 +1,4 @@
-# app2.py — Robust Flask wrapper for final1 pipeline (improved feature alignment + scaler handling)
+
 import os
 import sys
 import io
@@ -11,7 +11,7 @@ from contextlib import redirect_stdout
 from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, flash
 
-# Use Agg backend for matplotlib (server-safe)
+
 import matplotlib
 matplotlib.use("Agg")
 
@@ -55,11 +55,8 @@ IMG_DIR = os.path.join(STATIC_DIR, "img")
 for d in (TEMPLATES_DIR, STATIC_DIR, IMG_DIR):
     os.makedirs(d, exist_ok=True)
 
-# --- Templates & CSS (kept small & same style as prior) ---
+# --- Templates & CSS ---
 _layout = """<!doctype html> ... (omitted here for brevity; same as your existing layout) ... """
-# To avoid repeating long template strings in this message, in your copy use the same templates you already have.
-# The rest of the file assumes templates exist at templates/layout.html, templates/index.html, templates/result.html,
-# and style at static/style.css. If not present, previous app2.py wrote them; keep those.
 
 # ------------------ Utilities & robust model discovery --------------------
 
@@ -154,7 +151,7 @@ def align_features_to_expected(X_df, expected_cols):
     X_df = X_df.reindex(columns=expected_cols, fill_value=0.0)
     return X_df
 
-# compute recommendation (unchanged logic; caps are unchanged)
+# compute recommendation 
 def compute_recommendation(pred_ret, textual_top10):
     if pred_ret is None:
         return "HOLD", "No prediction available", "hold"
@@ -218,12 +215,12 @@ def predict():
         scaler_path = arts.get("scaler")
         meta_path = arts.get("meta")
 
-        # If user chose full training, run final1.main() (it will write artifacts)
+        
         if mode == "train":
             if not os.path.exists(FINAL1_PATH):
                 flash("final1.py not found for full retrain.", "error")
                 return redirect(url_for("index"))
-            # call final1.main() capturing stdout
+            
             buf = io.StringIO()
             with redirect_stdout(buf):
                 try:
@@ -257,7 +254,7 @@ def predict():
             scaler_path = arts.get("scaler")
             meta_path = arts.get("meta")
 
-        # --- Build features using pipeline helpers (required) ---
+        # --- Build features using pipeline helpers ---
         if pipeline is None:
             flash("Pipeline helpers (final1) not importable — cannot build features.", "error")
             return redirect(url_for("index"))
@@ -330,16 +327,13 @@ def predict():
         if expected_cols:
             print(f"[INFO] Aligning {len(X.columns)} current features to {len(expected_cols)} expected training features.")
             
-            # This single reindex step handles all cases:
-            # 1. Drops columns in X that are not in expected_cols.
-            # 2. Adds columns from expected_cols that are not in X (fills with 0.0).
-            # 3. Sorts all columns to match the exact order of expected_cols.
+           
             X = X.reindex(columns=expected_cols, fill_value=0.0)
             
             print(f"[INFO] DataFrame aligned. Final shape for scaling: {X.shape}")
 
         elif scaler is not None and hasattr(scaler, "n_features_in_"):
-            # Secondary fallback if we have scaler but no meta
+            
             expected_num_features = scaler.n_features_in_
             if X.shape[1] != expected_num_features:
                 flash(f"Feature mismatch: Model expects {expected_num_features} features, but pipeline generated {X.shape[1]}.", "error")
@@ -354,19 +348,18 @@ def predict():
         X = X.astype(float).fillna(0.0)
 
 
-        # --- Scale input (robust to feature-name mismatches) ---
+        # --- Scale input ---
         if scaler is not None:
             try:
-                # The .reindex() above ensures feature names and order match.
-                # This should now work without the fallback.
+                
                 X_scaled = scaler.transform(X)
                 
             except Exception as e:
-                # This fallback should no longer be needed, but kept as a safety net
+                
                 import numpy as np
                 print(f"[WARN] Scaler transform failed despite alignment. Using raw numpy transform. Details: {e}")
                 
-                # Check if the error is about number of features
+                
                 if "features" in str(e) and hasattr(scaler, "n_features_in_"):
                     n_expected = scaler.n_features_in_
                     if X.shape[1] != n_expected:
@@ -375,7 +368,7 @@ def predict():
                 
                 X_scaled = scaler.transform(np.asarray(X))
         else:
-            X_scaled = X.values # Use .values if no scaler
+            X_scaled = X.values 
 
         # --- Predict next-day return ---
         try:
@@ -396,7 +389,7 @@ def predict():
             # date of the chosen row
             chosen_date = pd.to_datetime(row["date"].iloc[0])
 
-            # select past week (strictly before or up to chosen_date)
+            
             mask = (final_df["date"] <= chosen_date) & (final_df["date"] > (chosen_date - pd.Timedelta(days=lookback_days)))
             past_week = final_df.loc[mask]
 
@@ -425,7 +418,7 @@ def predict():
             except Exception:
                 prev_hl = 0.0
 
-            # Tuning knobs (change these as you experiment)
+            # Tuning knobs 
             POS_THRESH = 0.02    # above this -> positive
             NEG_THRESH = -0.02   # below this -> negative
             SCALE = 2.0          # scales how much sentiment magnitude maps to fraction of high-low
@@ -535,7 +528,7 @@ def predict():
                     docs_for_day = []
                     for source_name, doc_list in [("News", news_docs), ("Reddit", reddit_docs), ("YouTube", yt_docs)]:
                         for doc in doc_list:
-                            # handle Doc class or dict robustly (avoid evaluating doc.get if doc is a Doc)
+                            
                             if hasattr(doc, "date"):
                                 pub_date = str(doc.date)[:10]
                                 title = getattr(doc, "text", "")
@@ -568,8 +561,7 @@ def predict():
             event_table = []
 
 
-        # --- Recommendation based on sentiment-adjusted prediction and aggregated sentiment ---
-        # Note: this overrides compute_recommendation() result based on adjusted sentiment.
+        
         try:
             # ensure mean_sent, pred_price, pred_price_raw are defined
             if "mean_sent" not in locals():

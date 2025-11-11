@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-Patched v14 pipeline (Option A) with fixes:
- - target -> next-day return (target_ret)
- - recency-weighted (EW) aggregation of text features (no ffill)
- - sample weights emphasizing recent/event/breakout/news days for LGBM
- - residual LSTM trained on continuous residual series, walk-forward correction
- - LightGBM tuning and removal of near-constant columns
- - keeps existing caching, fetch logic & debug outputs
-"""
+
 
 import os
 # --- Environment Setup ---
@@ -41,7 +33,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import mean_absolute_error, r2_score
 import matplotlib
-# Use non-interactive Agg backend (no GUI windows). Must be set *before* importing pyplot.
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -175,7 +167,7 @@ def embed_texts(texts: List[str]) -> np.ndarray:
     return _nlp["embedder"].encode(texts, show_progress_bar=False, convert_to_numpy=True,
                                   normalize_embeddings=True, batch_size=32)
 
-# ----------------------------- Data Fetching (Fixed) ---------------------------------
+# ----------------------------- Data Fetching ---------------------------------
 def get_stock_data(ticker: str, days: int) -> pd.DataFrame:
     end = datetime.now()
     start = end - timedelta(days=days)
@@ -224,7 +216,7 @@ def get_stock_data(ticker: str, days: int) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     return df[required_cols].sort_values("date").reset_index(drop=True)
 
-# --- (Other fetching functions unchanged) ---
+
 def fetch_news_rss(queries, days: int) -> List[Doc]:
     if isinstance(queries, str): queries = [queries]
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -299,7 +291,7 @@ def fetch_youtube_docs(queries, days: int) -> List[Doc]:
             print(f"WARNING: YouTube fetch failed for query '{query}': {e}")
     return docs
 
-# ----------------------------- Feature Engineering (v14 patched) ---------------------------------
+# ----------------------------- Feature Engineering ---------------------------------
 
 def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -468,7 +460,7 @@ def process_text_source(docs: List[Doc], source_name: str) -> pd.DataFrame:
 
     df_full = pd.concat([df_raw_text, sent_df, pca_df], axis=1)
     
-    # Aggregate per date by mean for now (we will apply EW recency across dates later)
+    # Aggregate per date by mean for now 
     agg_cols = sent_cols + pca_cols
     agg_funcs = {col: "mean" for col in agg_cols}
     df_aggregated = df_full.groupby("date").agg(agg_funcs).reset_index()
@@ -476,7 +468,7 @@ def process_text_source(docs: List[Doc], source_name: str) -> pd.DataFrame:
     print(f"Aggregated {source_name} features shape: {df_aggregated.shape}")
     return df_aggregated
 
-# --- NEW helper: exponential recency-weighting across days for merged text features ---
+# --- exponential recency-weighting across days for merged text features ---
 def apply_ewm_to_text_features(features_df: pd.DataFrame, text_cols: List[str], halflife_days: float = RECENCY_HALFLIFE_DAYS):
     """
     Apply exponential recency-weighted averaging across days for the given text_cols.
@@ -541,7 +533,7 @@ def build_hybrid_featureset(stock_df, news_df, reddit_df, yt_df, event_df) -> pd
     if len(text_pca_cols) > 0:
         features = apply_ewm_to_text_features(features, text_pca_cols, halflife_days=RECENCY_HALFLIFE_DAYS)
 
-    # Now create attention-style aggregated columns and event multipliers
+    # create attention-style aggregated columns and event multipliers
     scaler = MinMaxScaler()
     # fill any remaining inf/nan safely
     features['intraday_vol'] = features['intraday_vol'].replace([np.inf, -np.inf], 0).fillna(0)
@@ -587,7 +579,7 @@ def build_hybrid_featureset(stock_df, news_df, reddit_df, yt_df, event_df) -> pd
         shifted.columns = [f"{col}_lag_{lag}" for col in shifted.columns]
         features = pd.concat([features, shifted], axis=1)
 
-    # --- NEW: target becomes next-day return (no leakage) ---
+    # --- NEW: target becomes next-day return ---
     features['target_ret'] = features['close'].shift(-1) / features['close'] - 1.0
 
     # Replace inf and fill NaNs
@@ -739,13 +731,13 @@ def train_and_evaluate_models(df: pd.DataFrame):
     pred_price_from_ret = test_close_today * (1 + lgbm_preds_test)
     actual_price_next = actual_next_close
 
-    # Remove rows where actual next-day close is NaN (usually the final test row)
+    # Remove rows where actual next-day close is NaN 
     valid_mask = ~np.isnan(actual_price_next)
     if not valid_mask.all():
         print(f"[INFO] Dropping {np.sum(~valid_mask)} final test rows with no observed next-day close (alignment).")
     pred_price_from_ret = pred_price_from_ret[valid_mask]
     actual_price_next = actual_price_next[valid_mask]
-    # Also keep date vector aligned for plotting
+    
     dates_aligned = test_df['date'].iloc[valid_mask.nonzero()[0]].reset_index(drop=True) if isinstance(valid_mask, np.ndarray) else test_df['date'][valid_mask]
 
     # Evaluate LGBM in price-space
@@ -757,7 +749,7 @@ def train_and_evaluate_models(df: pd.DataFrame):
     # --- Residual LSTM ---
     print("\n--- Training Residual LSTM ---")
     # train residuals = true_train_next_return - lgbm_pred_train_return
-    # both are aligned on train_df rows
+    
     train_residuals = y_train.reset_index(drop=True) - pd.Series(lgbm_preds_train).reset_index(drop=True)
 
     Xr, yr = create_simple_residual_sequences_from_series(train_residuals, LSTM_LOOKBACK)
@@ -780,12 +772,11 @@ def train_and_evaluate_models(df: pd.DataFrame):
     else:
         print("Not enough residual sequences for LSTM (skipped).")
 
-    # --- Hybrid Evaluation (walk-forward with proper aligned comparison) ---
+    # --- Hybrid Evaluation ---
     hybrid_price_arr = None
     mae_hybrid, r2_hybrid = None, None
     if lstm_model:
-        # We'll build hybrid predictions for the same aligned indices as above (valid_mask)
-        # First compute predicted corrections for each test row (walk-forward using true residuals)
+       
         history = list(train_residuals.iloc[-LSTM_LOOKBACK:].values)
         hybrid_prices_full = []
         for i in range(len(test_df)):
@@ -804,7 +795,7 @@ def train_and_evaluate_models(df: pd.DataFrame):
             true_resid = (y_test.iloc[i] - lgbm_preds_test[i])
             history.pop(0); history.append(true_resid)
 
-        # align hybrid array with valid_mask (drop last if needed)
+        # align hybrid array with valid_mask 
         hybrid_prices_full = np.array(hybrid_prices_full)
         hybrid_price_arr = hybrid_prices_full[valid_mask]
 
@@ -840,7 +831,7 @@ def train_and_evaluate_models(df: pd.DataFrame):
     plt.legend(fontsize=9)
     plt.grid(True, linestyle="--", alpha=0.4)
 
-    # ✅ Fix spacing and avoid blank sides
+    #  Fix spacing and avoid blank sides
     plt.xticks(rotation=25)
     plt.tight_layout(pad=1.0)
     plot_path = os.path.join(ART_DIR, "final_price_prediction_v15.png")
@@ -850,7 +841,7 @@ def train_and_evaluate_models(df: pd.DataFrame):
 
 
 
-        # --- ✅ Next-Day Price Prediction Output ---
+        # ---  Next-Day Price Prediction Output ---
     # Use the last available row from df_for_training to predict next-day price
     last_close = df.iloc[-1]["close"]
     last_features = df.iloc[-1].drop(["date", "target", "target_ret"], errors="ignore")
@@ -860,13 +851,13 @@ def train_and_evaluate_models(df: pd.DataFrame):
     next_close_pred = last_close * (1 + next_ret_pred)
 
     print("\n==========================")
-    print("📅 Next-Day Forecast Summary")
+    print("Next-Day Forecast Summary")
     print("==========================")
     print(f"Previous Close: {last_close:.2f}")
     print(f"Predicted Next Close: {next_close_pred:.2f}")
     print(f"Predicted Return: {(next_ret_pred * 100):+.2f}%")
 
-        # --- ✅ Save all key artifacts for Flask app reuse ---
+        # ---  Save all key artifacts for Flask app reuse ---
     try:
         # Save model, scaler, and meta info
         joblib.dump(lgbm_model, os.path.join(ART_DIR, "lgbm_model.pkl"))
@@ -879,7 +870,7 @@ def train_and_evaluate_models(df: pd.DataFrame):
             "feature_columns": list(X_train.columns)
         }
         joblib.dump(meta, os.path.join(ART_DIR, "pipeline_meta.pkl"))
-        print(f"[INFO] ✅ Saved model, scaler, and metrics to {ART_DIR}")
+        print(f"[INFO] Saved model, scaler, and metrics to {ART_DIR}")
     except Exception as e:
         print(f"[WARN] Could not save artifacts: {e}")
 
@@ -936,7 +927,7 @@ def safe_lgbm_predict(model, X):
 #     last_close = sim_prices[-1]
 
 #     for step in range(1, days_ahead + 1):
-#         # 1️⃣ Prepare last row features
+#         # 1️ Prepare last row features
 #         last_features = sim_df.iloc[-1].drop(['date', 'target', 'target_ret'], errors='ignore')
 #         last_features_df = pd.DataFrame([last_features])
 
@@ -957,11 +948,11 @@ def safe_lgbm_predict(model, X):
 #         # --- Scale ---
 #         last_features_scaled = trained_scaler.transform(last_features_df)
 
-#         # 2️⃣ Predict next-day return (safe call)
+#         # 2️Predict next-day return (safe call)
 #         next_ret_lgbm = float(safe_lgbm_predict(trained_lgbm, last_features_scaled)[0])
 #         next_price_lgbm = last_close * (1 + next_ret_lgbm)
 
-#         # 3️⃣ Residual LSTM correction
+#         # 3️Residual LSTM correction
 #         aligned_sim_features = sim_df.reindex(columns=X_train_cols, fill_value=0)
 #         aligned_scaled = trained_scaler.transform(aligned_sim_features)
 #         all_errors = sim_df['target_ret'].reset_index(drop=True) - safe_lgbm_predict(trained_lgbm, aligned_scaled)
@@ -972,13 +963,13 @@ def safe_lgbm_predict(model, X):
 #         next_error = float(error_scaler.inverse_transform([[next_error_scaled]])[0][0])
 #         next_price_hybrid = next_price_lgbm + (last_close * next_error)
 
-#         # 4️⃣ Blend for stability
+#         # 4️Blend for stability
 #         blended_price = (alpha * next_price_lgbm) + ((1 - alpha) * next_price_hybrid)
 
-#         # 5️⃣ Append simulated price
+#         # 5️Append simulated price
 #         sim_prices.append(blended_price)
 
-#         # 6️⃣ Create synthetic next row
+#         # 6️Create synthetic next row
 #         new_row = sim_df.iloc[-1].copy()
 #         new_row['close'] = blended_price
 #         new_row['open'] = last_close
@@ -988,7 +979,7 @@ def safe_lgbm_predict(model, X):
 #         new_row['date'] = new_row['date'] + pd.Timedelta(days=1)
 #         sim_df = pd.concat([sim_df, pd.DataFrame([new_row])], ignore_index=True)
 
-#         # 7️⃣ Recompute indicators
+#         # 7️Recompute indicators
 #         sim_df = add_technical_features(sim_df)
 #         sim_df['target_ret'] = sim_df['close'].pct_change().fillna(0)
 #         last_close = blended_price
@@ -1000,7 +991,7 @@ def safe_lgbm_predict(model, X):
 #     })
 
 #     pct_change = (sim_prices[-1] - sim_prices[0]) / sim_prices[0] * 100
-#     trend = "📈 Bullish" if pct_change > 1 else ("📉 Bearish" if pct_change < -1 else "⚖️ Neutral")
+#     trend = " Bullish" if pct_change > 1 else (" Bearish" if pct_change < -1 else "⚖️ Neutral")
 
 #     print(f"\n=== {days_ahead}-Day Forecast Summary ===")
 #     print(f"Start Price: {sim_prices[0]:.2f}")
@@ -1103,7 +1094,7 @@ Your output should be in the following structure:
         return "Summary generation failed."
 
 
-# ----------------------------- Main Runner (patched) ---------------------------------
+# ----------------------------- Main Runner ---------------------------------
 def main():
     print(f"=== STARTING DATA ANALYSIS & TRAINING PIPELINE (V14 - Patched) ===")
     
@@ -1194,7 +1185,7 @@ def main():
     )
     
     if final_df.empty or final_df.shape[0] < 50:
-         print("\n❌ Pipeline finished with errors: No data in final DataFrame after processing.")
+         print("\n Pipeline finished with errors: No data in final DataFrame after processing.")
          return
 
     # --- 5. Train Models and Evaluate ---
@@ -1205,7 +1196,7 @@ def main():
         (mae_lgbm, r2_lgbm), hybrid_metrics, next_close_pred = metrics
 
         print("\n==========================")
-        print("📊 Model Performance Summary")
+        print("Model Performance Summary")
         print("==========================")
         print(f"LGBM   → MAE: {mae_lgbm:.4f} | R²: {r2_lgbm:.4f}")
         if hybrid_metrics:
@@ -1217,13 +1208,13 @@ def main():
         
 
     else:
-        print("\n❌ Model training failed.")
+        print("\n Model training failed.")
 
 
-    print(f"\n✅ Pipeline finished successfully. Artifacts saved to '{ART_DIR}'")
+    print(f"\n Pipeline finished successfully. Artifacts saved to '{ART_DIR}'")
 
 
-        # --- ✅ EXTRA FEATURE: Top 10 Recent Textual Data with Sentiment Vectors ---
+        # --- EXTRA FEATURE: Top 10 Recent Textual Data with Sentiment Vectors ---
     print("\n==========================")
     print("📰 Top 10 Recent Textual Insights (News / Reddit / YouTube)")
     print("==========================")
@@ -1267,12 +1258,12 @@ def main():
         # Save to CSV
         top10_path = os.path.join(ART_DIR, f"{TICKER}_top10_textual_insights.csv")
         top10[["date", "source", "text", "pos", "neu", "neg"]].to_csv(top10_path, index=False)
-        print(f"\n✅ Saved Top 10 textual insights to: {top10_path}")
+        print(f"\n Saved Top 10 textual insights to: {top10_path}")
     else:
-        print("⚠️ NLP unavailable or no textual data found — skipping sentiment insights.")
+        print(" NLP unavailable or no textual data found — skipping sentiment insights.")
 
     # --- Generate Summary & Recommendation ---
-    print("\n📝 Generating Gemini Summary...")
+    print("\n Generating Gemini Summary...")
     summary = generate_gemini_summary(
         news_docs,
         reddit_docs,
